@@ -17,40 +17,48 @@ from redis import StrictRedis
 
 def wraps_set_expire(func):
     """
-    装饰器， 设置key默认过期时间
+    装饰器：写操作成功后给 key 续上默认过期时间。
+
+    只装饰写操作。读操作不续期——否则一个被频繁读取的 key 永远不会过期。
+
+    None 和 False 都代表这次写入没有真正发生（参数非法，或 SETNX 未抢到），
+    此时不能续期：否则 set_nx 抢锁失败反而会把别人持有的锁续命。
+    注意必须用 `is False` 而不是 `not ret`，因为 0 是合法的写入结果
+    （比如 sAdd 添加了一个已存在的成员）。
     """
-    
+
     @functools.wraps(func)
     def wrapper_func(self, keyname, *args, **kwargs):
         ret_func = func(self, keyname, *args, **kwargs)
-        # 设置key的过期时间
-        if ret_func is not None:
-            self.set_expire(keyname)
+        if ret_func is None or ret_func is False:
+            return ret_func
+        self.set_expire(keyname)
         return ret_func
-    
+
     return wrapper_func
 
 
 class LibRedis:
     # 默认所有key的前缀
     key_prefix = 'RRRR_'
-    
+
     # redis 连接对象
     obj_redis = None
-    
+
     def __init__(self, host, port, db, expired=259200, prefix=None):
         """
         初始化 默认的过期时间为3天
         """
         if not host or not port:
-            raise Exception('LibRedis host port must not null')
-        
+            raise ValueError('LibRedis host port must not null')
+
         if prefix:
             self.key_prefix = prefix.strip()
         # construct
-        self.obj_redis = StrictRedis(host=host, port=port, db=db, charset='utf-8')
+        # 用 encoding 而不是 charset：charset 在 redis-py 4.x 已废弃，5.0 起移除
+        self.obj_redis = StrictRedis(host=host, port=port, db=db, encoding='utf-8')
         self.expired = expired
-    
+
     def key_make(self, keyname=None):
         """
         处理所有key，增加前缀
@@ -58,22 +66,22 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         return self.key_prefix + str(keyname).strip()
-    
+
     def set_expire(self, keyname=None, custom_seconds=0):
         """
         设置key的过期时间，装饰器调用
-        @param keyname: 
+        @param keyname:
         @param custom_seconds: 过期时间，秒数
         @return:
         """
         if not keyname:
             return None
-        
+
         expired_time = self.expired if not custom_seconds else custom_seconds
         return self.obj_redis.expire(self.key_make(keyname), expired_time)
-    
+
     def set_p_expire(self, keyname=None, milliseconds=0):
         """
         设置key的过期时间，装饰器调用
@@ -83,13 +91,13 @@ class LibRedis:
         """
         if not keyname or not milliseconds:
             return None
-        
+
         return self.obj_redis.pexpire(self.key_make(keyname), milliseconds)
-    
+
     # --------------------------------------------------------
     # String
     # --------------------------------------------------------
-    
+
     @wraps_set_expire
     def set(self, keyname=None, value=None):
         """
@@ -100,13 +108,13 @@ class LibRedis:
         """
         if not keyname or value is None:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         if isinstance(value, str):
             value = value.strip()
-        
+
         return self.obj_redis.set(keyname, value)
-    
+
     @wraps_set_expire
     def set_nx(self, keyname=None, value=None):
         """
@@ -118,13 +126,13 @@ class LibRedis:
         """
         if not keyname or value is None:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         if isinstance(value, str):
             value = value.strip()
-        
+
         return self.obj_redis.setnx(keyname, value)
-    
+
     def get(self, keyname=None):
         """
         获取指定 key 的值。
@@ -135,12 +143,12 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         result = self.obj_redis.get(keyname)
-        
+
         return None if not result else bytes.decode(result)
-    
+
     def delete(self, keyname=None, have_key_make=True):
         """
         删除已存在的键。不存在的 key 会被忽略
@@ -154,7 +162,7 @@ class LibRedis:
         if have_key_make:
             keyname = self.key_make(keyname.strip())
         return self.obj_redis.delete(keyname)
-    
+
     def keys(self, keyname=None, have_key_make=True):
         """
         获取对应key
@@ -165,7 +173,7 @@ class LibRedis:
         if have_key_make:
             keyname = self.key_make(keyname.strip())
         return self.obj_redis.keys(keyname)
-    
+
     def scan(self, keyname=None, have_key_make=True):
         """
         scan方式 获取对应key
@@ -175,23 +183,28 @@ class LibRedis:
             return None
         if have_key_make:
             keyname = self.key_make(keyname.strip())
-        cursor = '0'
+        cursor = 0
         keys_list = []
-        while cursor != 0:
+        while True:
             cursor, keys = self.obj_redis.scan(cursor=cursor, match=keyname)
             keys_list.extend(keys)
+            # 游标回到 0 表示一轮遍历结束
+            if cursor == 0:
+                break
         return keys_list
-    
+
     def exists(self, keyname=None):
         """
         查看是否存在键名为key的字段
         ashname含有给定字段key，返回 True。
         keyname不存在 或 key 不存在，返回 False
         """
-        
+        if not keyname:
+            return None
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.exists(keyname)
-    
+
     @wraps_set_expire
     def append(self, keyname=None, value=None):
         """
@@ -205,31 +218,35 @@ class LibRedis:
         """
         if not keyname or value is None:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         if isinstance(value, str):
             value = value.strip()
         else:
             value = str(value)
-        
+
         return self.obj_redis.append(keyname, value)
-    
-    @wraps_set_expire
+
     def incr(self, keyname=None, expire=None):
         """
         将 keyname 中储存的数字值增一。
         如果 keyname 不存在，那么 key 的值会先被初始化为 0 ，然后再执行 INCR 操作。
         如果值包含错误的类型，或字符串类型的值不能表示为数字，那么返回一个错误。
         本操作的值限制在 64 位(bit)有符号数字表示之内。
+        @param keyname:
+        @param expire: 自定义过期秒数，留空则用实例的默认过期时间
         return：
         执行 INCR 命令之后 key 的值
         """
         if not keyname:
             return None
-        
-        keyname = self.key_make(keyname.strip())
-        return self.obj_redis.incr(keyname, 1)
-    
+
+        keyname = keyname.strip()
+        result = self.obj_redis.incr(self.key_make(keyname), 1)
+        # 这里不走 wraps_set_expire，因为要支持调用方指定过期时间
+        self.set_expire(keyname, expire or 0)
+        return result
+
     @wraps_set_expire
     def incrBy(self, keyname=None, amount=1):
         """
@@ -242,16 +259,15 @@ class LibRedis:
         """
         if not keyname or not amount:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
-        
-        if isinstance(amount, int):
-            amount = max(0, amount)
-        else:
+
+        # INCRBY 支持负数（等价于 DECRBY），不能把负增量夹成 0
+        if not isinstance(amount, int):
             amount = 1
-        
+
         return self.obj_redis.incrby(keyname, amount)
-    
+
     @wraps_set_expire
     def decr(self, keyname=None):
         """
@@ -264,10 +280,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.decr(keyname, 1)
-    
+
     @wraps_set_expire
     def decrBy(self, keyname=None, amount=1):
         """
@@ -278,17 +294,17 @@ class LibRedis:
         """
         if not keyname or not amount:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         amount = int(amount)
         return self.obj_redis.decr(keyname, amount)
-    
+
     # --------------------------------------------------------
     # Hash 哈希
     # 一个string类型的field和value的映射表，hash特别适合用于存储对象
     # 每个 hash 可以存储 232 - 1 键值对（40多亿）
     # --------------------------------------------------------
-    
+
     @wraps_set_expire
     def hSet(self, keyname=None, key=None, value=None):
         """
@@ -302,15 +318,15 @@ class LibRedis:
         """
         if not keyname or not key or value is None:
             return False
-        
+
         keyname = self.key_make(keyname.strip())
         key = str(key).strip()
         if not key:
             return False
-        
+
         self.obj_redis.hset(keyname, key, value)
         return True
-    
+
     @wraps_set_expire
     def hMset(self, keyname=None, data_dict=None):
         """
@@ -323,17 +339,16 @@ class LibRedis:
         """
         if data_dict is None:
             data_dict = dict()
-        
+
         if not keyname or not data_dict:
             return False
-        
+
         if not isinstance(data_dict, dict):
             return False
-        
+
         self.obj_redis.hset(name=self.key_make(keyname.strip()), mapping=data_dict)
         return True
-    
-    @wraps_set_expire
+
     def hGet(self, keyname=None, key=None):
         """
         获取存储在哈希表中指定字段的值
@@ -341,21 +356,20 @@ class LibRedis:
         """
         if not keyname or not key:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         key = str(key).strip()
-        
+
         result = self.obj_redis.hget(keyname, key)
         if not result:
             return None
-        
+
         # bytes to str
         if isinstance(result, bytes):
             return bytes.decode(result)
-        
+
         return str(result).strip()
-    
-    @wraps_set_expire
+
     def hLen(self, keyname=None):
         """
         获取哈希表中字段的数量
@@ -363,11 +377,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.hlen(keyname)
-    
-    @wraps_set_expire
+
     def hKeys(self, keyname=None):
         """
         获取哈希表中的所有域（field）
@@ -376,20 +389,19 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         result = self.obj_redis.hkeys(keyname)
         if not result:
             return None
-        
+
         # bytes to str
         ret_list = list()
         for v in result:
             ret_list.append(bytes.decode(v))
-        
+
         return ret_list
-    
-    @wraps_set_expire
+
     def hVals(self, keyname=None):
         """
         哈希表所有域(field)的值
@@ -398,20 +410,19 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         result = self.obj_redis.hvals(keyname)
         if not result:
             return None
-        
+
         # bytes to str
         ret_list = list()
         for v in result:
             ret_list.append(bytes.decode(v))
-        
+
         return ret_list
-    
-    @wraps_set_expire
+
     def hGetAll(self, keyname=None):
         """
         获取在哈希表中指定 keyname 的所有字段和值
@@ -421,19 +432,19 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         result = self.obj_redis.hgetall(keyname)
         if not result:
             return None
-        
+
         # bytes to str
         ret_dict = dict()
         for k, v in result.items():
             ret_dict[bytes.decode(k)] = bytes.decode(v)
-        
+
         return ret_dict
-    
+
     def hExists(self, keyname=None, key=None):
         """
         查看哈希表 keyname 中，是否存在键名为key的字段
@@ -442,10 +453,10 @@ class LibRedis:
         """
         if not keyname or key is None:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.hexists(keyname, key)
-    
+
     def hDel(self, keyname=None, *keys):
         """
         删除哈希表 key 中的一个或多个指定字段，不存在的字段将被忽略
@@ -455,15 +466,15 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.hdel(keyname, *keys)
-    
+
     # --------------------------------------------------------
     # List 列表, 左(Left)为头部，右(Right)为尾部
     # 一个列表最多可以包含 232 - 1 个元素 (4294967295, 每个列表超过40亿个元素)
     # --------------------------------------------------------
-    
+
     @wraps_set_expire
     def lPush(self, keyname=None, *values):
         """
@@ -474,10 +485,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.lpush(keyname, *values)
-    
+
     @wraps_set_expire
     def lPop(self, keyname=None):
         """
@@ -486,10 +497,14 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
-        return self.obj_redis.lpop(keyname)
-    
+        result = self.obj_redis.lpop(keyname)
+        if not result:
+            return None
+        # bytes to str，与 rPop 保持一致
+        return bytes.decode(result)
+
     @wraps_set_expire
     def rPush(self, keyname=None, *values):
         """
@@ -501,10 +516,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.rpush(keyname, *values)
-    
+
     @wraps_set_expire
     def rPop(self, keyname=None):
         """
@@ -513,15 +528,14 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         result = self.obj_redis.rpop(keyname)
         if not result:
             return None
         # bytes to str
         return bytes.decode(result)
-    
-    @wraps_set_expire
+
     def lLen(self, keyname=None):
         """
         获取列表长度
@@ -530,10 +544,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.llen(keyname)
-    
+
     @wraps_set_expire
     def lTrim(self, keyname=None, start=0, end=-1):
         """
@@ -544,11 +558,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.ltrim(keyname, start, end)
-    
-    @wraps_set_expire
+
     def lGetRange(self, keyname=None, start=0, end=-1):
         """
         返回列表中指定区间内的元素，区间以偏移量 START 和 END 指定
@@ -558,7 +571,7 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         result = self.obj_redis.lrange(keyname, start, end)
         if not result:
@@ -567,9 +580,9 @@ class LibRedis:
         ret_list = list()
         for v in result:
             ret_list.append(bytes.decode(v))
-        
+
         return ret_list
-    
+
     @wraps_set_expire
     def lRemove(self, keyname=None, value=None, count=1):
         """
@@ -582,17 +595,17 @@ class LibRedis:
         """
         if not keyname or value is None:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.lrem(keyname, count, value)
-    
+
     # --------------------------------------------------------
     # Set 无序集合
     # Set 是 String 类型的无序集合。集合成员是唯一的。
     # 集合是通过哈希表实现的，所以添加，删除，查找的复杂度都是 O(1)
     # 集合中最大的成员数为 232 - 1 (4294967295, 每个集合可存储40多亿个成员)
     # --------------------------------------------------------
-    
+
     @wraps_set_expire
     def sAdd(self, keyname=None, *values):
         """
@@ -605,8 +618,7 @@ class LibRedis:
             return None
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.sadd(keyname, *values)
-    
-    @wraps_set_expire
+
     def sCard(self, keyname=None):
         """
         获取集合key中元素的数量
@@ -616,7 +628,7 @@ class LibRedis:
             return None
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.scard(keyname)
-    
+
     def sDiff(self, keyname=None, *keys):
         """
         差集
@@ -628,24 +640,24 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
-        
+
         other_keys = list()
         for k in keys:
             other_keys.append(self.key_make(k))
-        
+
         result = self.obj_redis.sdiff(keyname, *other_keys)
         if not result:
             return None
-        
+
         # bytes to str
         ret_set = set()
         for v in result:
             ret_set.add(bytes.decode(v))
-        
+
         return ret_set
-    
+
     @wraps_set_expire
     def sDiffStore(self, store_key=None, key=None, *keys):
         """
@@ -657,16 +669,16 @@ class LibRedis:
         """
         if not store_key or not key:
             return None
-        
+
         store_key = self.key_make(store_key.strip())
         key = self.key_make(key.strip())
-        
+
         other_keys = list()
         for k in keys:
             other_keys.append(self.key_make(k))
-        
+
         return self.obj_redis.sdiffstore(store_key, key, *other_keys)
-    
+
     def sInter(self, keyname=None, *keys):
         """
         交集
@@ -675,24 +687,24 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
-        
+
         other_keys = list()
         for k in keys:
             other_keys.append(self.key_make(k))
-        
+
         result = self.obj_redis.sinter(keyname, *other_keys)
         if not result:
             return None
-        
+
         # bytes to str
         ret_set = set()
         for v in result:
             ret_set.add(bytes.decode(v))
-        
+
         return ret_set
-    
+
     @wraps_set_expire
     def sInterStore(self, store_key=None, key=None, *keys):
         """
@@ -703,16 +715,16 @@ class LibRedis:
         """
         if not store_key or not key:
             return None
-        
+
         store_key = self.key_make(store_key.strip())
         key = self.key_make(key.strip())
-        
+
         other_keys = list()
         for k in keys:
             other_keys.append(self.key_make(k))
-        
+
         return self.obj_redis.sinterstore(store_key, key, *other_keys)
-    
+
     def sUnion(self, keyname=None, *keys):
         """
         并集
@@ -722,24 +734,24 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
-        
+
         other_keys = list()
         for k in keys:
             other_keys.append(self.key_make(k))
-        
+
         result = self.obj_redis.sunion(keyname, *other_keys)
         if not result:
             return None
-        
+
         # bytes to str
         ret_set = set()
         for v in result:
             ret_set.add(bytes.decode(v))
-        
+
         return ret_set
-    
+
     @wraps_set_expire
     def sUnionStore(self, store_key=None, key=None, *keys):
         """
@@ -750,17 +762,16 @@ class LibRedis:
         """
         if not store_key or not key:
             return None
-        
+
         store_key = self.key_make(store_key.strip())
         key = self.key_make(key.strip())
-        
+
         other_keys = list()
         for k in keys:
             other_keys.append(self.key_make(k))
-        
+
         return self.obj_redis.sunionstore(store_key, key, *other_keys)
-    
-    @wraps_set_expire
+
     def sIsMember(self, keyname=None, value=None):
         """
         判断成员元素是否是集合的成员
@@ -769,11 +780,11 @@ class LibRedis:
         """
         if not keyname or value is None:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
-        return self.obj_redis.sismember(keyname, value)
-    
-    @wraps_set_expire
+        # redis-py 4.x 返回 bool、5.x 返回 int，这里统一成 bool
+        return bool(self.obj_redis.sismember(keyname, value))
+
     def sMembers(self, keyname=None):
         """
         返回集合中的所有的成员。
@@ -781,19 +792,19 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         result = self.obj_redis.smembers(keyname)
-        
+
         if not result:
             return None
         # bytes to str
         ret_set = set()
         for v in result:
             ret_set.add(bytes.decode(v))
-        
+
         return ret_set
-    
+
     @wraps_set_expire
     def sRem(self, keyname=None, *values):
         """
@@ -805,10 +816,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.srem(keyname, *values)
-    
+
     @wraps_set_expire
     def sPop(self, keyname=None):
         """
@@ -818,14 +829,13 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         result = self.obj_redis.spop(keyname)
-        
+
         # bytes to str
         return None if not result else bytes.decode(result)
-    
-    @wraps_set_expire
+
     def sRandMember(self, keyname=None, count=1):
         """
         返回集合中的随机元素，而不对集合进行任何改动
@@ -839,26 +849,25 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
-        
-        if isinstance(count, int):
-            count = max(0, count)
-        else:
+
+        # count 为负是 Redis 的既定语义（允许重复），不能夹成 0
+        if not isinstance(count, int):
             count = 1
-        
+
         result = self.obj_redis.srandmember(keyname, count)
-        
+
         if not result:
             return None
-        
+
         # bytes to str
         ret_list = list()
         for v in result:
             ret_list.append(bytes.decode(v))
-        
+
         return ret_list
-    
+
     # --------------------------------------------------------
     # Zset( sorted set ) 有序集合
     # 有序集合和集合一样也是string类型元素的集合,且不允许重复的成员
@@ -866,7 +875,7 @@ class LibRedis:
     # 集合是通过哈希表实现的，所以添加，删除，查找的复杂度都是O(1)
     # 集合中最大的成员数为 232 - 1 (4294967295, 每个集合可存储40多亿个成员)
     # --------------------------------------------------------
-    
+
     @wraps_set_expire
     def zAdd(self, keyname=None, **kwargs):
         """
@@ -882,10 +891,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.zadd(keyname, kwargs)
-    
+
     def zRangeByScore(self, keyname=None, min=None, max=None, withscores=False):
         """
         分数值正序
@@ -897,13 +906,13 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         result = self.obj_redis.zrangebyscore(keyname, min, max, withscores=withscores)
-        
+
         if not result:
             return None
-        
+
         # bytes to str
         if not withscores:
             # return list
@@ -916,9 +925,9 @@ class LibRedis:
             for field, score in result:
                 zret.append((bytes.decode(field), score))
             zret = dict(zret)
-        
+
         return zret
-    
+
     def zRevRangeByScore(self, keyname=None, max=None, min=None, withscores=False):
         """
         分数值逆序
@@ -930,13 +939,13 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         result = self.obj_redis.zrevrangebyscore(keyname, max, min, withscores=withscores)
-        
+
         if not result:
             return None
-        
+
         # bytes to str
         if not withscores:
             # return list
@@ -949,9 +958,9 @@ class LibRedis:
             for field, score in result:
                 zret.append((bytes.decode(field), score))
             zret = dict(zret)
-        
+
         return zret
-    
+
     def zRank(self, keyname=None, member=None):
         """
         排名正序
@@ -962,10 +971,10 @@ class LibRedis:
         """
         if not keyname or member is None:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.zrank(keyname, member)
-    
+
     def zRevRank(self, keyname=None, member=None):
         """
         排名逆序
@@ -976,10 +985,10 @@ class LibRedis:
         """
         if not keyname or member is None:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.zrevrank(keyname, member)
-    
+
     def zRange(self, keyname=None, start=None, end=None, withscores=False):
         """
         位置正序
@@ -990,13 +999,13 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         result = self.obj_redis.zrange(keyname, start, end, withscores=withscores)
-        
+
         if not result:
             return None
-        
+
         # bytes to str
         if not withscores:
             # return list
@@ -1009,9 +1018,9 @@ class LibRedis:
             for field, score in result:
                 zret.append((bytes.decode(field), score))
             zret = dict(zret)
-        
+
         return zret
-    
+
     def zRevrange(self, keyname=None, start=None, end=None, withscores=False):
         """
         位置逆序
@@ -1022,13 +1031,13 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         result = self.obj_redis.zrevrange(keyname, start, end, withscores=withscores)
-        
+
         if not result:
             return None
-        
+
         # bytes to str
         if not withscores:
             # return list
@@ -1041,9 +1050,9 @@ class LibRedis:
             for field, score in result:
                 zret.append((bytes.decode(field), score))
             zret = dict(zret)
-        
+
         return zret
-    
+
     def zRem(self, keyname, *member):
         """
         移除有序集中的一个或多个成员，不存在的成员将被忽略。
@@ -1053,10 +1062,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.zrem(keyname, *member)
-    
+
     def zRemRangeByRank(self, keyname=None, min=None, max=None):
         """
         删除正序
@@ -1065,10 +1074,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.zremrangebyrank(keyname, min, max)
-    
+
     def zRemrangebyscore(self, keyname=None, min=None, max=None):
         """
         删除正序
@@ -1077,20 +1086,20 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.zremrangebyscore(keyname, min, max)
-    
+
     def zScore(self, keyname=None, key=None):
         """
         获取有序集合中某个成员的分数
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.zscore(keyname, key)
-    
+
     def zCard(self, keyname=None):
         """
         计算集合中元素的数量
@@ -1099,10 +1108,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.zcard(keyname)
-    
+
     def zCount(self, keyname=None, min=None, max=None):
         """
         计算有序集合中指定分数区间的成员数量
@@ -1110,14 +1119,14 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(keyname.strip())
         return self.obj_redis.zcount(keyname, min, max)
-    
+
     # --------------------------------------------------------
     # Bloom filter.
     # --------------------------------------------------------
-    
+
     @wraps_set_expire
     def bloom_add(self, keyname=None, values=None):
         """
@@ -1129,10 +1138,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(str(keyname).strip())
         return self.obj_redis.bf().add(keyname, values)
-    
+
     @wraps_set_expire
     def bloom_madd(self, keyname=None, values=None):
         """
@@ -1144,10 +1153,10 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(str(keyname).strip())
         return self.obj_redis.bf().madd(keyname, *values)
-    
+
     def bloom_exists(self, keyname=None, values=None):
         """
         bloom
@@ -1158,6 +1167,6 @@ class LibRedis:
         """
         if not keyname:
             return None
-        
+
         keyname = self.key_make(str(keyname).strip())
         return self.obj_redis.bf().exists(keyname, values)
